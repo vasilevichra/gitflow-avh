@@ -246,11 +246,12 @@ r,[no]rebase           Rebase before merging
 p,[no]preserve-merges  Preserve merges while rebasing
 [no]push               Push to origin after performing finish
 k,[no]keep             Keep branch after performing finish
-keepremote!        	   Keep the remote branch
+keepremote!            Keep the remote branch
 keeplocal!             Keep the local branch
 D,[no]force_delete     Force delete feature branch after finish
 S,[no]squash           Squash feature during merge
 no-ff!                 Never fast-forward during the merge
+G,gitlab-mr            Add Gitlab merge request support
 "
 	local finish_base
 
@@ -265,7 +266,8 @@ no-ff!                 Never fast-forward during the merge
 	DEFINE_boolean 'force_delete' false "force delete feature branch after finish" D
 	DEFINE_boolean 'squash' false "squash feature during merge" S
 	DEFINE_boolean 'squash-info' false "add branch info during squash"
-	DEFINE_boolean 'no-ff!' false "Don't fast-forward ever during merge "
+	DEFINE_boolean 'no-ff!' false "don't fast-forward ever during merge"
+	DEFINE_boolean 'gitlab-mr' false "Gitlab merge request instead of simple merge" G
 
 	# Override defaults with values from config
 	gitflow_override_flag_boolean   "feature.finish.fetch"             "fetch"
@@ -279,9 +281,18 @@ no-ff!                 Never fast-forward during the merge
 	gitflow_override_flag_boolean   "feature.finish.squash"            "squash"
 	gitflow_override_flag_boolean   "feature.finish.squash-info"       "squash_info"
 	gitflow_override_flag_boolean   "feature.finish.no-ff"             "no_ff"
+	gitflow_override_flag_boolean   "feature.finish.gitlab-mr"         "gitlab-mr"
 
 	# Parse arguments
 	parse_args "$@"
+
+	# Check config for Gitlab
+	if flag gitlab-mr; then
+		GITLAB_CONFIG="~/.gitlab"
+		if [ ! -f "$GITLAB_CONFIG" ]; then
+			die "Please create the config file $GITLAB_CONFIG with Gitlab settings first."
+		fi
+	fi
 
 	# Use current branch if no name is given
 	if [ "$NAME" = "" ]; then
@@ -324,7 +335,7 @@ no-ff!                 Never fast-forward during the merge
 			else
 				# If the user cancelled the merge and decided to wait until
 				# later,that's fine. But we have to acknowledge this by
-				# removing the MERGE_BASE file and continuing normal execution
+				# removing the MERGE_BASE file and continuing norgitlabion
 				# of the finish
 				rm -f "$DOT_GIT_DIR/.gitflow/MERGE_BASE"
 			fi
@@ -387,37 +398,65 @@ no-ff!                 Never fast-forward during the merge
 	# Merge into BASE
 	git_do checkout "$BASE_BRANCH" || die "Could not check out branch '$BASE_BRANCH'."
 
-	if noflag squash; then
-		if flag no_ff; then
-			git_do merge --no-ff "$BRANCH"
-		else
-			if [ "$(git rev-list -n2 "$BASE_BRANCH..$BRANCH" | wc -l)" -eq 1 ]; then
-				git_do merge --ff "$BRANCH"
-			else
-				git_do merge --no-ff "$BRANCH"
-			fi
-		fi
-	else
-		git_do merge --squash "$BRANCH"
-		flag squash_info && gitflow_create_squash_message "Merged feature branch '$BRANCH'" "$BASE_BRANCH" "$BRANCH" > "$DOT_GIT_DIR/SQUASH_MSG"
-		git_do commit
-	fi
+	if flag gitlab-mr; then # Gitlab merge request
+		. ~/.gitlab
 
-	if [ $? -ne 0 ]; then
-		# Oops.. we have a merge conflict!
-		# Write the given $BASE_BRANCH to a temporary file as we will
-		# be needing it later.
-		mkdir -p "$DOT_GIT_DIR/.gitflow"
-		echo "$BASE_BRANCH" > "$DOT_GIT_DIR/.gitflow/MERGE_BASE"
-		echo
-		echo "There were merge conflicts. To resolve the merge conflict manually, use:"
-		echo "    git mergetool"
-		echo "    git commit"
-		echo
-		echo "You can then complete the finish by running it again:"
-		echo "    git flow feature finish $NAME"
-		echo
-		exit 1
+		GITLAB_FEATURE_NAME=$(echo $BRANCH | sed -r 's/^[^\/]+\/(.+)$/\1/g')
+		GITLAB_GROUP_AND_PROJECT=$(git_do config --get remote.origin.url | sed -r 's/^.+[:](.+)\.git$/\1/g' | sed -e 's/\//%2f/g')
+		GITLAB_HEADER="PRIVATE-TOKEN: ${GITLAB_API_PRIVATE_TOKEN}"
+		GITLAB_PROJECT_JSON=$(curl --silent --header "${GITLAB_HEADER}" "${GITLAB_API_ENDPOINT}/projects/${GITLAB_GROUP_AND_PROJECT}")
+		GITLAB_PROJECT_ID=$(echo -n ${GITLAB_PROJECT_JSON} | sed -rn 's/^\{"id":([0-9]+)\,.*$/\1/p')
+
+		echo "Pushing the new branch $BRANCH"
+		git_do push -u "$ORIGIN" "$BRANCH:$BRANCH"
+
+		if -z $(git branch -r | grep $DEVELOP_BRANCH); then
+			echo "Pushing the nonexistent remote branch $DEVELOP_BRANCH"
+			git_do push -u origin "$DEVELOP_BRANCH:$DEVELOP_BRANCH"
+		fi
+
+		echo "Create Gitlab merge request"
+		curl -X POST --header "${GITLAB_HEADER}"\
+			-d "id=${GITLAB_PROJECT_ID}"\
+			-d "source_branch=${BRANCH}"\
+			-d "target_branch=$DEVELOP_BRANCH"\
+			-d "remove_source_branch=true"\
+			-d "assignee_id=${GITLAB_DEFAULT_ASSIGNEE_ID}"\
+			-d "title=See%20my%20new%20amaizing%20feature%20%22${GITLAB_FEATURE_NAME}%22!"\
+			"${GITLAB_API_ENDPOINT}/projects/${GITLAB_PROJECT_ID}/merge_requests"
+	else # Normal merge
+		if noflag squash; then
+			if flag no_ff; then
+				git_do merge --no-ff "$BRANCH"
+			else
+				if [ "$(git rev-list -n2 "$BASE_BRANCH..$BRANCH" | wc -l)" -eq 1 ]; then
+					git_do merge --ff "$BRANCH"
+				else
+					git_do merge --no-ff "$BRANCH"
+				fi
+			fi
+		else
+			git_do merge --squash "$BRANCH"
+			flag squash_info && gitflow_create_squash_message "Merged feature branch '$BRANCH'" "$BASE_BRANCH" "$BRANCH" > "$DOT_GIT_DIR/SQUASH_MSG"
+			git_do commit
+		fi
+
+		if [ $? -ne 0 ]; then
+			# Oops.. we have a merge conflict!
+			# Write the given $BASE_BRANCH to a temporary file as we will
+			# be needing it later.
+			mkdir -p "$DOT_GIT_DIR/.gitflow"
+			echo "$BASE_BRANCH" > "$DOT_GIT_DIR/.gitflow/MERGE_BASE"
+			echo
+			echo "There were merge conflicts. To resolve the merge conflict manually, use:"
+			echo "    git mergetool"
+			echo "    git commit"
+			echo
+			echo "You can then complete the finish by running it again:"
+			echo "    git flow feature finish $NAME"
+			echo
+			exit 1
+		fi
 	fi
 
 	run_post_hook "$NAME" "$ORIGIN" "$BRANCH"
